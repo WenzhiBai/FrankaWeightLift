@@ -13,6 +13,16 @@
 
 namespace franka_weight_lift {
 
+namespace {
+// The align move counts as finished only once the arm has actually stopped, so
+// a fast pass through the target cannot release the free plane mid-swing.
+constexpr double kAlignSettleSpeed = 0.01;  // m/s
+constexpr double kAlignSettleRate = 0.05;   // rad/s
+// Below this the commanded force has effectively decayed to zero, which is when
+// the virtual walls may be released again.
+constexpr double kForceOffThreshold = 0.05;  // N
+}  // namespace
+
 bool WeightLiftController::init(hardware_interface::RobotHW* robot_hw,
                                 ros::NodeHandle& node_handle) {
   std::string arm_id;
@@ -94,7 +104,8 @@ bool WeightLiftController::init(hardware_interface::RobotHW* robot_hw,
 
 bool WeightLiftController::readParameters(ros::NodeHandle& node_handle) {
   // Commanded force. target_force_ is a magnitude in newtons; it is rendered
-  // along -Z of the robot base, i.e. towards the earth.
+  // along -Z of the robot base, i.e. towards the earth. It defaults to 0, so
+  // the tool starts out free in the plane.
   if (!node_handle.getParam("desired_force", target_force_)) {
     ROS_ERROR_STREAM("WeightLiftController: Could not read parameter desired_force");
     return false;
@@ -113,9 +124,10 @@ bool WeightLiftController::readParameters(ros::NodeHandle& node_handle) {
 
   node_handle.param("lateral_stiffness", lateral_stiffness_, lateral_stiffness_);
   node_handle.param("lateral_damping", lateral_damping_, lateral_damping_);
+  node_handle.param("max_lateral_force", max_lateral_force_, max_lateral_force_);
   node_handle.param("rotational_stiffness", rotational_stiffness_, rotational_stiffness_);
   node_handle.param("rotational_damping", rotational_damping_, rotational_damping_);
-  node_handle.param("free_damping", free_damping_, free_damping_);
+  node_handle.param("max_rotational_torque", max_rotational_torque_, max_rotational_torque_);
   node_handle.param("nullspace_stiffness", nullspace_stiffness_, nullspace_stiffness_);
 
   node_handle.param("wall_x_min", wall_x_min_, wall_x_min_);
@@ -134,20 +146,20 @@ bool WeightLiftController::readParameters(ros::NodeHandle& node_handle) {
   node_handle.param("min_settle_sec", min_settle_sec_, min_settle_sec_);
   node_handle.param("max_settle_sec", max_settle_sec_, max_settle_sec_);
 
+  node_handle.param("align_position_tolerance", align_position_tolerance_,
+                    align_position_tolerance_);
+  node_handle.param("align_orientation_tolerance", align_orientation_tolerance_,
+                    align_orientation_tolerance_);
+  node_handle.param("max_align_sec", max_align_sec_, max_align_sec_);
+  node_handle.param("max_align_y_offset", max_align_y_offset_, max_align_y_offset_);
+  node_handle.param("max_align_angle", max_align_angle_, max_align_angle_);
+
   if (wall_x_min_ > 0.0 || wall_x_max_ < 0.0 || wall_z_min_ > 0.0 || wall_z_max_ < 0.0) {
     ROS_ERROR_STREAM(
-        "WeightLiftController: the virtual walls are relative to the startup pose, so the "
-        "*_min bounds must be <= 0 and the *_max bounds >= 0, otherwise the controller starts "
-        "outside its own walls");
+        "WeightLiftController: the virtual walls are relative to the pose where the force is "
+        "first requested, so the *_min bounds must be <= 0 and the *_max bounds >= 0, otherwise "
+        "the controller arms them outside its own walls");
     return false;
-  }
-  // The lower z wall has to hold the commanded pull, so its steady-state
-  // penetration is desired_force / wall_stiffness. Warn if that is coarse.
-  const double wall_penetration = target_force_ / std::max(wall_stiffness_, 1.0);
-  if (wall_penetration > 0.05) {
-    ROS_WARN_STREAM("WeightLiftController: at " << target_force_ << "N the lower z wall will sag "
-                                                << wall_penetration * 1000.0
-                                                << "mm; raise wall_stiffness");
   }
 
   return true;
@@ -157,10 +169,9 @@ void WeightLiftController::starting(const ros::Time& time) {
   franka::RobotState robot_state = state_handle_->getRobotState();
 
   const Eigen::Isometry3d initial_pose(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
-  initial_position_ = initial_pose.translation();
-  // Orientation target is frozen at whatever attitude the end effector has now,
-  // so spawning the controller never produces a reorientation motion. From here
-  // on the end-effector frame keeps this fixed attitude relative to the base.
+  // Hold the pose we start in while the wrench estimate settles. beginAlignment()
+  // swaps in the base-aligned targets once that is done.
+  hold_position_ = initial_pose.translation();
   orientation_d_ = Eigen::Quaterniond(initial_pose.rotation());
 
   q_d_nullspace_ = Eigen::Matrix<double, 7, 1>::Map(robot_state.q.data());
@@ -169,6 +180,11 @@ void WeightLiftController::starting(const ros::Time& time) {
   desired_force_ = 0.0;
   force_integral_ = 0.0;
 
+  // The walls only exist while a force is being rendered; they anchor themselves
+  // the moment a non-zero force is requested.
+  walls_armed_ = false;
+  wall_origin_ = initial_pose.translation();
+
   initial_wrench_O_ = Eigen::Matrix<double, 6, 1>::Map(robot_state.O_F_ext_hat_K.data());
   if (!compensate_initial_wrench_) {
     initial_wrench_O_.setZero();
@@ -176,8 +192,9 @@ void WeightLiftController::starting(const ros::Time& time) {
 
   transitionToState(ControllerState::INITIAL, time);
   ROS_WARN_STREAM(
-      "WeightLiftController: settling the external wrench estimate - do NOT touch the robot until "
-      "'weight lift active' is logged");
+      "WeightLiftController: settling the external wrench estimate, then aligning the end "
+      "effector with the robot base - THE ARM MOVES ON ITS OWN. Stay clear and do NOT touch the "
+      "robot until 'weight lift active' is logged");
 }
 
 void WeightLiftController::update(const ros::Time& time, const ros::Duration& period) {
@@ -207,10 +224,28 @@ void WeightLiftController::update(const ros::Time& time, const ros::Duration& pe
       // Stay put in all six DOF while the wrench estimate settles.
       wrench_d = poseHoldWrench(pose, velocity);
       next_state = handleInitialState(measured_wrench_O, time);
+      if (next_state == ControllerState::ALIGN) {
+        next_state = beginAlignment(pose);
+      }
+      break;
+
+    case ControllerState::ALIGN:
+      // Same stiff 6-DOF hold, but on the base-aligned targets: base Y is pulled
+      // to 0 and the attitude to diag(1, -1, -1) while X and Z stay put.
+      wrench_d = poseHoldWrench(pose, velocity);
+      next_state = handleAlignState(pose, velocity, time);
       break;
 
     case ControllerState::LIFT:
       wrench_d = liftWrench(pose, velocity, measured_wrench_O, period);
+      break;
+
+    case ControllerState::FAULT:
+      ROS_ERROR_STREAM_THROTTLE(5.0,
+                                "WeightLiftController: alignment refused, holding the startup "
+                                "pose. Move the arm closer to the base X-Z plane with the tool "
+                                "pointing down, then respawn the controller");
+      wrench_d = poseHoldWrench(pose, velocity);
       break;
 
     case ControllerState::UNKNOWN:
@@ -219,8 +254,9 @@ void WeightLiftController::update(const ros::Time& time, const ros::Duration& pe
       wrench_d = poseHoldWrench(pose, velocity);
   }
 
-  Eigen::Matrix<double, 7, 1> tau_d =
-      jacobian.transpose() * wrench_d + nullspaceTorque(jacobian, q, dq) + coriolis;
+  // Eigen::Matrix<double, 7, 1> tau_d =
+  //     jacobian.transpose() * wrench_d + nullspaceTorque(jacobian, q, dq) + coriolis;
+  Eigen::Matrix<double, 7, 1> tau_d = jacobian.transpose() * wrench_d + coriolis;
   tau_d = saturateTorqueRate(tau_d, tau_J_d);
 
   for (size_t i = 0; i < joint_handles_.size(); ++i) {
@@ -231,15 +267,21 @@ void WeightLiftController::update(const ros::Time& time, const ros::Duration& pe
       0.5, "state: " << stateToString(current_state_) << ", commanded force: " << desired_force_
                      << "N, measured z force: "
                      << measured_wrench_O(kFreeAxisZ) - initial_wrench_O_(kFreeAxisZ)
-                     << "N, free-plane offset: "
-                     << (pose.translation()(kFreeAxisX) - initial_position_(kFreeAxisX)) << "m x, "
-                     << (pose.translation()(kFreeAxisZ) - initial_position_(kFreeAxisZ)) << "m z");
+                     << "N, position x " << pose.translation()(kFreeAxisX) << "m, y "
+                     << pose.translation()(kLockedAxisY) << "m, z "
+                     << pose.translation()(kFreeAxisZ) << "m, walls "
+                     << (walls_armed_ ? "armed" : "off"));
 
   // Ramp the commanded force towards the target, so both the startup ramp and
   // live dynamic_reconfigure changes are smooth.
   desired_force_ = force_filter_gain_ * target_force_ + (1.0 - force_filter_gain_) * desired_force_;
 
   if (next_state != current_state_) {
+    if (next_state == ControllerState::LIFT) {
+      // The align move changed the joint configuration, so re-latch the elbow
+      // reference on the one the aligned pose actually ended up in.
+      q_d_nullspace_ = q;
+    }
     transitionToState(next_state, time);
   }
 }
@@ -255,16 +297,27 @@ Eigen::Matrix<double, 6, 1> WeightLiftController::orientationHoldWrench(
   const Eigen::Vector3d error =
       -(pose.rotation() * (error_angle_axis.angle() * error_angle_axis.axis()));
 
+  // The stiffness term is clamped, so the attitude error the ALIGN state has to
+  // remove cannot command a torque the wrist has to saturate its way out of. The
+  // damping term stays outside the clamp so it keeps bounding the speed.
+  Eigen::Vector3d torque = -rotational_stiffness_ * error;
+  const double torque_norm = torque.norm();
+  if (torque_norm > max_rotational_torque_) {
+    torque *= max_rotational_torque_ / torque_norm;
+  }
+
   Eigen::Matrix<double, 6, 1> wrench = Eigen::Matrix<double, 6, 1>::Zero();
-  wrench.tail(3) = -rotational_stiffness_ * error - rotational_damping_ * velocity.tail(3);
+  wrench.tail(3) = torque - rotational_damping_ * velocity.tail(3);
   return wrench;
 }
 
 Eigen::Matrix<double, 6, 1> WeightLiftController::poseHoldWrench(
     const Eigen::Isometry3d& pose, const Eigen::Matrix<double, 6, 1>& velocity) const {
   Eigen::Matrix<double, 6, 1> wrench = orientationHoldWrench(pose, velocity);
-  wrench.head(3) = -lateral_stiffness_ * (pose.translation() - initial_position_) -
-                   lateral_damping_ * velocity.head(3);
+  for (int axis = 0; axis < 3; ++axis) {
+    wrench(axis) =
+        lateralHoldForce(pose.translation()(axis) - hold_position_(axis), velocity(axis));
+  }
   return wrench;
 }
 
@@ -297,23 +350,35 @@ Eigen::Matrix<double, 6, 1> WeightLiftController::liftWrench(
                                        -max_force_correction_, max_force_correction_);
   wrench(kFreeAxisZ) += correction;
 
-  // 3. Hold base Y so the end effector stays in the X-Z plane it started in.
-  wrench(kLockedAxisY) +=
-      -lateral_stiffness_ * (pose.translation()(kLockedAxisY) - initial_position_(kLockedAxisY)) -
-      lateral_damping_ * velocity(kLockedAxisY);
+  // 3. Hold base Y at 0, so the end effector works in the base's own X-Z plane.
+  wrench(kLockedAxisY) += lateralHoldForce(
+      pose.translation()(kLockedAxisY) - hold_position_(kLockedAxisY), velocity(kLockedAxisY));
 
-  // 4. Light damping inside the free plane. No stiffness: the human sets the
-  //    position, this only keeps the free axes from drifting and ringing.
-  wrench(kFreeAxisX) += -free_damping_ * velocity(kFreeAxisX);
-  wrench(kFreeAxisZ) += -free_damping_ * velocity(kFreeAxisZ);
+  // 4. Virtual walls, so a release under load cannot run the arm into its joint
+  //    limits. They only exist while a force is being asked for: below that the
+  //    plane is unbounded, so the tool can be carried to wherever the work is,
+  //    and the walls anchor themselves at the pose where the force is applied.
+  if (!walls_armed_ && target_force_ > 0.0) {
+    wall_origin_ = pose.translation();
+    walls_armed_ = true;
+    ROS_INFO_STREAM("WeightLiftController: virtual walls armed at x "
+                    << wall_origin_(kFreeAxisX) << "m, z " << wall_origin_(kFreeAxisZ) << "m");
+  } else if (walls_armed_ && target_force_ == 0.0 && desired_force_ < kForceOffThreshold) {
+    // Only once the rendered force has decayed too, so the arm is never left
+    // unbounded while it is still pulling.
+    walls_armed_ = false;
+    ROS_INFO_STREAM("WeightLiftController: force back to zero, virtual walls released");
+  }
+  if (walls_armed_) {
+    wrench(kFreeAxisX) += wallForce(pose.translation()(kFreeAxisX) - wall_origin_(kFreeAxisX),
+                                    velocity(kFreeAxisX), wall_x_min_, wall_x_max_);
+    wrench(kFreeAxisZ) += wallForce(pose.translation()(kFreeAxisZ) - wall_origin_(kFreeAxisZ),
+                                    velocity(kFreeAxisZ), wall_z_min_, wall_z_max_);
+  }
 
-  // 5. Virtual walls, so a release cannot run the arm into its joint limits.
-  wrench(kFreeAxisX) += wallForce(pose.translation()(kFreeAxisX) - initial_position_(kFreeAxisX),
-                                  velocity(kFreeAxisX), wall_x_min_, wall_x_max_);
-  wrench(kFreeAxisZ) += wallForce(pose.translation()(kFreeAxisZ) - initial_position_(kFreeAxisZ),
-                                  velocity(kFreeAxisZ), wall_z_min_, wall_z_max_);
-
-  // 6. Speed cap in the free plane: brake whatever exceeds max_free_speed_.
+  // 5. Speed cap in the free plane: brake whatever exceeds max_free_speed_. This
+  //    is the only velocity-dependent term left in the free plane, and it is
+  //    zero below the cap, so it costs nothing while the tool is hand-guided.
   const Eigen::Vector2d free_velocity(velocity(kFreeAxisX), velocity(kFreeAxisZ));
   const double free_speed = free_velocity.norm();
   if (free_speed > max_free_speed_) {
@@ -324,6 +389,16 @@ Eigen::Matrix<double, 6, 1> WeightLiftController::liftWrench(
   }
 
   return wrench;
+}
+
+double WeightLiftController::lateralHoldForce(double offset, double velocity) const {
+  // The stiffness term is clamped so a large offset - above all the y offset the
+  // ALIGN state has to remove - cannot slam the arm across it. The damping term
+  // stays outside the clamp, so it still bounds the speed of that move
+  // (terminal speed = max_lateral_force / lateral_damping) and still decelerates
+  // the arm as it arrives.
+  return std::clamp(-lateral_stiffness_ * offset, -max_lateral_force_, max_lateral_force_) -
+         lateral_damping_ * velocity;
 }
 
 double WeightLiftController::wallForce(double offset, double velocity, double min,
@@ -340,8 +415,9 @@ double WeightLiftController::wallForce(double offset, double velocity, double mi
 Eigen::Matrix<double, 7, 1> WeightLiftController::nullspaceTorque(
     const Eigen::Matrix<double, 6, 7>& jacobian, const Eigen::Matrix<double, 7, 1>& q,
     const Eigen::Matrix<double, 7, 1>& dq) const {
-  // Keeps the redundant DOF (the elbow) near its startup configuration while
-  // the human drags the end effector around the free plane.
+  // Keeps the redundant DOF (the elbow) near q_d_nullspace_ while the human
+  // drags the end effector around the free plane. Projected into the nullspace
+  // of J^T, so it adds no end-effector force.
   Eigen::MatrixXd jacobian_transpose_pinv;
   pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
   return (Eigen::MatrixXd::Identity(7, 7) - jacobian.transpose() * jacobian_transpose_pinv) *
@@ -370,6 +446,14 @@ void WeightLiftController::weightLiftParamCallback(
   k_i_ = config.k_i;
   ROS_INFO_STREAM("WeightLiftController: desired_force " << target_force_ << "N, k_p " << k_p_
                                                          << ", k_i " << k_i_);
+  // The lower z wall has to hold the commanded pull, so its steady-state
+  // penetration is desired_force / wall_stiffness. Warn if that is coarse.
+  const double wall_penetration = target_force_ / std::max(wall_stiffness_, 1.0);
+  if (wall_penetration > 0.05) {
+    ROS_WARN_STREAM("WeightLiftController: at " << target_force_ << "N the lower z wall will sag "
+                                                << wall_penetration * 1000.0
+                                                << "mm; raise wall_stiffness");
+  }
 }
 
 std::string WeightLiftController::stateToString(ControllerState state) const {
@@ -378,8 +462,12 @@ std::string WeightLiftController::stateToString(ControllerState state) const {
       return "UNKNOWN";
     case ControllerState::INITIAL:
       return "INITIAL";
+    case ControllerState::ALIGN:
+      return "ALIGN";
     case ControllerState::LIFT:
       return "LIFT";
+    case ControllerState::FAULT:
+      return "FAULT";
     default:
       return "UNKNOWN";
   }
@@ -399,9 +487,8 @@ WeightLiftController::ControllerState WeightLiftController::handleInitialState(
     const Eigen::Matrix<double, 6, 1>& measured_wrench_O, const ros::Time& time) {
   if (!compensate_initial_wrench_) {
     ROS_WARN_STREAM(
-        "WeightLiftController: initial wrench compensation disabled, weight lift "
-        "active immediately");
-    return ControllerState::LIFT;
+        "WeightLiftController: initial wrench compensation disabled, aligning immediately");
+    return ControllerState::ALIGN;
   }
 
   // Track the estimate until it stops moving, then keep the last value as bias.
@@ -410,19 +497,87 @@ WeightLiftController::ControllerState WeightLiftController::handleInitialState(
 
   const double elapsed = (time - state_entry_time_).toSec();
   if (elapsed >= min_settle_sec_ && change < settle_wrench_tolerance_) {
-    ROS_INFO_STREAM("WeightLiftController: weight lift active, initial wrench "
+    ROS_INFO_STREAM("WeightLiftController: external wrench settled at "
                     << initial_wrench_O_.head(3).transpose() << "N");
-    return ControllerState::LIFT;
+    return ControllerState::ALIGN;
   }
   if (elapsed >= max_settle_sec_) {
     ROS_WARN_STREAM("WeightLiftController: external wrench estimate did not settle within "
                     << max_settle_sec_ << "s (last change " << change
-                    << "N), weight lift active anyway with initial wrench "
+                    << "N), aligning anyway with initial wrench "
                     << initial_wrench_O_.head(3).transpose() << "N");
-    return ControllerState::LIFT;
+    return ControllerState::ALIGN;
   }
 
   return ControllerState::INITIAL;
+}
+
+WeightLiftController::ControllerState WeightLiftController::beginAlignment(
+    const Eigen::Isometry3d& pose) {
+  // Target attitude: end-effector X along base X, end-effector Y along -base Y,
+  // end-effector Z along -base Z, i.e. the tool pointing straight down. The
+  // columns of the matrix are the end-effector axes in base coordinates.
+  Eigen::Matrix3d aligned_rotation;
+  aligned_rotation << 1.0, 0.0, 0.0,  //
+      0.0, -1.0, 0.0,                 //
+      0.0, 0.0, -1.0;
+  const Eigen::Quaterniond aligned_orientation(aligned_rotation);
+
+  const double y_offset = pose.translation()(kLockedAxisY);
+  Eigen::Quaterniond orientation(pose.rotation());
+  if (aligned_orientation.coeffs().dot(orientation.coeffs()) < 0.0) {
+    orientation.coeffs() << -orientation.coeffs();
+  }
+  const double angle_error = Eigen::AngleAxisd(orientation.inverse() * aligned_orientation).angle();
+
+  // Both targets are commanded straight away, so refuse to start from a pose
+  // that would turn the align move into a long unsupervised travel.
+  if (std::abs(y_offset) > max_align_y_offset_ || angle_error > max_align_angle_) {
+    ROS_ERROR_STREAM("WeightLiftController: refusing to align, the end effector starts "
+                     << y_offset << "m off the base X-Z plane and " << angle_error
+                     << "rad off the target attitude (limits " << max_align_y_offset_ << "m and "
+                     << max_align_angle_ << "rad)");
+    return ControllerState::FAULT;
+  }
+
+  hold_position_(kLockedAxisY) = 0.0;
+  orientation_d_ = aligned_orientation;
+  ROS_INFO_STREAM("WeightLiftController: aligning with the robot base, removing "
+                  << y_offset << "m of y offset and " << angle_error << "rad of attitude error");
+  return ControllerState::ALIGN;
+}
+
+WeightLiftController::ControllerState WeightLiftController::handleAlignState(
+    const Eigen::Isometry3d& pose, const Eigen::Matrix<double, 6, 1>& velocity,
+    const ros::Time& time) {
+  const double y_error = std::abs(pose.translation()(kLockedAxisY) - hold_position_(kLockedAxisY));
+
+  Eigen::Quaterniond orientation(pose.rotation());
+  if (orientation_d_.coeffs().dot(orientation.coeffs()) < 0.0) {
+    orientation.coeffs() << -orientation.coeffs();
+  }
+  const double angle_error = Eigen::AngleAxisd(orientation.inverse() * orientation_d_).angle();
+
+  const bool stopped =
+      velocity.head(3).norm() < kAlignSettleSpeed && velocity.tail(3).norm() < kAlignSettleRate;
+
+  if (y_error < align_position_tolerance_ && angle_error < align_orientation_tolerance_ &&
+      stopped) {
+    ROS_INFO_STREAM("WeightLiftController: weight lift active, aligned with the robot base ("
+                    << y_error * 1000.0 << "mm and " << angle_error
+                    << "rad residual). The end effector is free in the base X-Z plane; the "
+                       "virtual walls anchor themselves when a non-zero desired_force is asked "
+                       "for");
+    return ControllerState::LIFT;
+  }
+  if ((time - state_entry_time_).toSec() >= max_align_sec_) {
+    ROS_WARN_STREAM("WeightLiftController: alignment did not converge within "
+                    << max_align_sec_ << "s (" << y_error << "m and " << angle_error
+                    << "rad residual), weight lift active anyway - base Y stays servoed to 0");
+    return ControllerState::LIFT;
+  }
+
+  return ControllerState::ALIGN;
 }
 
 }  // namespace franka_weight_lift
