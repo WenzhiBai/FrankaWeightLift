@@ -1,0 +1,42 @@
+<?xml version="1.0" ?>
+<!--
+  Brings up franka_control and spawns the weight-lift controller.
+
+  The end effector renders `desired_force` newtons downwards (along -Z of the
+  robot base) while staying free to be moved by hand in the base X-Z plane.
+  Base Y and all three rotations are held.
+
+  Do not touch the robot until "weight lift active" is logged: the controller
+  measures the wrench already acting on the flange first and cancels it.
+-->
+<launch>
+  <arg name="robot" default="fr3" doc="choose your robot. Possible values: [panda, fr3]"/>
+  <arg name="load_gripper" default="false"/>
+  <arg name="robot_ip" default="192.168.1.11"/>
+  <arg name="arm_id" default="$(arg robot)"/>
+  <arg name="desired_force" default="10.0"
+       doc="Downward force at the end effector in newtons. Overrides the config yaml."/>
+  <arg name="rqt_reconfigure" default="false"
+       doc="Open rqt_reconfigure to tune desired_force / k_p / k_i live."/>
+
+  <!-- ROSCONSOLE env must precede the franka_control include so the
+       controller_manager / WeightLiftController plugin inherits the config. -->
+  <env name="ROSCONSOLE_FORMAT" value="[${severity}] [${time}] [${function}:${line}]: ${message}"/>
+  <env name="ROSCONSOLE_STDOUT_LINE_BUFFERED" value="1"/>
+  <env name="ROSCONSOLE_CONFIG_FILE" value="$(find franka_weight_lift)/config/rosconsole.config"/>
+
+  <include file="$(find franka_control)/launch/franka_control.launch" pass_all_args="true">
+    <arg name="robot" value="$(arg robot)"/>
+    <arg name="load_gripper" value="$(arg load_gripper)"/>
+    <arg name="robot_ip" value="$(arg robot_ip)"/>
+    <arg name="arm_id"   value="$(arg arm_id)"/>
+  </include>
+
+  <rosparam command="load" file="$(find franka_weight_lift)/config/weight_lift_controller.yaml" subst_value="true"/>
+  <!-- Must come after the yaml load to win. -->
+  <rosparam param="/weight_lift_controller/desired_force" subst_value="true">$(arg desired_force)</rosparam>
+
+  <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="false" output="log" args="weight_lift_controller" required="true"/>
+
+  <node if="$(arg rqt_reconfigure)" name="rqt_reconfigure" pkg="rqt_reconfigure" type="rqt_reconfigure" output="screen" required="false"/>
+</launch>

@@ -1,0 +1,74 @@
+# Parameters of the weight-lift controller.
+#
+# Task frame is the robot base frame O (X forward, Y left, Z up). Base X and Z
+# are free (the human works in that vertical plane), base Y and all three
+# rotations are held. The commanded force is rendered along -Z, i.e. downwards.
+weight_lift_controller:
+    type: franka_weight_lift/WeightLiftController
+    arm_id: $(arg arm_id)
+    joint_names:
+        - $(arg arm_id)_joint1
+        - $(arg arm_id)_joint2
+        - $(arg arm_id)_joint3
+        - $(arg arm_id)_joint4
+        - $(arg arm_id)_joint5
+        - $(arg arm_id)_joint6
+        - $(arg arm_id)_joint7
+
+    # --- commanded force -----------------------------------------------------
+    # Magnitude in newtons, rendered along -Z of the base. Live-tunable through
+    # dynamic_reconfigure (rqt_reconfigure -> weight_lift_controller).
+    desired_force: 10.0
+    # First-order filter gain per 1 kHz tick applied to desired_force. 0.001
+    # gives a ~1 s time constant, which is both the startup ramp from 0 N and
+    # the ramp after a live change.
+    force_filter_gain: 0.001
+    # Optional PI on the force actually transmitted to the environment
+    # (O_F_ext_hat_K z, bias-corrected). 0 = pure feedforward. Raise k_p in
+    # small steps (0.1) first; it only compensates joint friction / model error.
+    k_p: 0.0
+    k_i: 0.0
+    max_force_correction: 15.0    # N, hard clamp on the PI contribution
+    max_force_integral: 50.0      # N*s, hard clamp on the integrator state
+    integral_freeze_speed: 0.05   # m/s, integrate only below this z speed
+
+    # --- held DOF ------------------------------------------------------------
+    # Base Y, so the end effector stays in the X-Z plane it started in.
+    lateral_stiffness: 1200.0     # N/m
+    lateral_damping: 55.0         # Ns/m  (0.8 * 2 * sqrt(k))
+    # All three rotations, held at the attitude measured at controller start.
+    rotational_stiffness: 80.0    # Nm/rad
+    rotational_damping: 14.0      # Nms/rad
+    # Also used as the 6-DOF hold while the INITIAL state settles.
+
+    # --- free plane ----------------------------------------------------------
+    # No stiffness in base X / base Z: the human sets the position there. Only
+    # light damping, to stop drift and ringing. 15 Ns/m costs 1.5 N at 0.1 m/s.
+    free_damping: 15.0            # Ns/m
+    # Keeps the elbow near its startup configuration while the tool is dragged.
+    nullspace_stiffness: 15.0
+
+    # --- virtual walls -------------------------------------------------------
+    # Metres relative to the pose at controller start. Free inside, spring
+    # outside. The *_min values must be <= 0 and *_max >= 0.
+    # NOTE: the lower z wall has to hold the commanded pull, so it sags by
+    # desired_force / wall_stiffness (10 N / 2000 N/m = 5 mm).
+    wall_x_min: -0.30
+    wall_x_max: 0.30
+    wall_z_min: -0.25
+    wall_z_max: 0.10
+    wall_stiffness: 2000.0        # N/m
+    wall_damping: 70.0            # Ns/m
+
+    # --- speed cap in the free plane -----------------------------------------
+    max_free_speed: 0.5           # m/s, braking starts above this
+    brake_damping: 200.0          # Ns/m applied to the excess speed only
+
+    # --- startup -------------------------------------------------------------
+    # Measure the wrench already acting on the flange (an unmodelled tool
+    # weight, mostly) and cancel it, so the free plane is force-neutral apart
+    # from the commanded force. Requires nobody touching the robot at startup.
+    compensate_initial_wrench: true
+    settle_wrench_tolerance: 0.05 # N, per-tick change below which it is settled
+    min_settle_sec: 1.0
+    max_settle_sec: 5.0

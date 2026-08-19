@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<library path="lib/libweight_lift_controller">
+  <class name="franka_weight_lift/WeightLiftController" type="franka_weight_lift::WeightLiftController" base_class_type="controller_interface::ControllerBase">
+    <description>
+      A controller that renders a constant downward force at the end effector while leaving it free
+      to be moved by hand inside the vertical X-Z plane of the robot base, holding the remaining
+      degrees of freedom.
+    </description>
+  </class>
+</library>
