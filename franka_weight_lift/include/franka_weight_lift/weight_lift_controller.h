@@ -23,19 +23,22 @@ namespace franka_weight_lift {
  * end effector while leaving the end effector free to be moved by hand inside a
  * vertical plane.
  *
- * Task frame is the robot base frame O. Of the six end-effector DOF:
- *  - base X and base Z are free: no position servo and no damping at all, only
- *    a speed cap and, once a force has been requested, virtual walls. A human
- *    can lift, lower and slide the tool.
- *  - base Y is held by a stiff spring/damper at y = 0, so the tool works in the
- *    base's own X-Z plane.
- *  - all three rotations are held by a stiff spring/damper at diag(1, -1, -1):
- *    end-effector X along base X, end-effector Y along -base Y, end-effector Z
- *    along -base Z, i.e. the tool pointing straight down.
+ * Task frame is the robot base frame O. Of the six end-effector DOF only two are
+ * held; everything else is free, with no stiffness and no damping at all:
+ *  - base X and base Z translation are free. A speed cap and, once a force has
+ *    been requested, virtual walls are the only terms acting there, and both are
+ *    zero until they trigger. This is the plane the human works in.
+ *  - base Y translation is held at y = 0, so the tool works in the base's own
+ *    X-Z plane.
+ *  - the tool axis (end-effector Z) is held *in* that plane: the one held
+ *    rotational DOF is the sideways tip out of the base X-Z plane. Tilting the
+ *    tool within the plane and spinning it while it hangs vertically are both
+ *    free, and cost exactly nothing.
  *
- * Those last two are *targets*, not startup values: the ALIGN state drives the
- * arm to them right after the controller is spawned, so **the arm moves on its
- * own at startup**.
+ * Those two targets are reached by an ALIGN state right after the controller is
+ * spawned, so **the arm moves on its own at startup**. Alignment removes the y
+ * offset and the sideways tip only; whatever tilt and spin the arm was parked
+ * with are left alone.
  *
  * On top of that the controller commands `desired_force` newtons along -Z of
  * the base (i.e. towards the earth, along gravity), optionally closed-loop on
@@ -64,13 +67,36 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
 
   bool readParameters(ros::NodeHandle& node_handle);
 
-  /** Spring/damper holding the orientation at orientation_d_. Base frame. */
-  Eigen::Matrix<double, 6, 1> orientationHoldWrench(
-      const Eigen::Isometry3d& pose, const Eigen::Matrix<double, 6, 1>& velocity) const;
+  /**
+   * The one held rotational DOF. `angle` is the signed angle by which the tool
+   * axis (end-effector Z) has tipped out of the base X-Z plane, and `axis` is
+   * the unit base-frame direction a torque has to act along to change it - a
+   * combination of base X and base Z in general, and never base Y, which is why
+   * tilting within the plane is always free. `axis` is exactly zero in the
+   * singular case, where the tool axis points along base Y and no torque can
+   * bring it back to the plane.
+   */
+  struct ToolAxisTip {
+    double angle{0.0};
+    Eigen::Vector3d axis{Eigen::Vector3d::Zero()};
+  };
+  ToolAxisTip toolAxisTip(const Eigen::Isometry3d& pose) const;
 
-  /** Fully stiff 6-DOF hold at hold_position_ / orientation_d_. */
+  /** Spring/damper on that one DOF. Zero torque in the two free directions. */
+  Eigen::Matrix<double, 6, 1> toolAxisHoldWrench(const Eigen::Isometry3d& pose,
+                                                 const Eigen::Matrix<double, 6, 1>& velocity) const;
+
+  /** Stiff spring/damper on all three translations, at hold_position_. */
+  Eigen::Vector3d translationHoldForce(const Eigen::Isometry3d& pose,
+                                       const Eigen::Matrix<double, 6, 1>& velocity) const;
+
+  /** Full 6-DOF stiff hold at hold_position_ / orientation_d_, for INITIAL. */
   Eigen::Matrix<double, 6, 1> poseHoldWrench(const Eigen::Isometry3d& pose,
                                              const Eigen::Matrix<double, 6, 1>& velocity) const;
+
+  /** Stiff translations (base Y on its aligned target) + the tool-axis hold. */
+  Eigen::Matrix<double, 6, 1> alignWrench(const Eigen::Isometry3d& pose,
+                                          const Eigen::Matrix<double, 6, 1>& velocity) const;
 
   /** The weight-lift wrench: pull-down + plane constraint + safety terms. */
   Eigen::Matrix<double, 6, 1> liftWrench(const Eigen::Isometry3d& pose,
@@ -78,15 +104,15 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
                                          const Eigen::Matrix<double, 6, 1>& measured_wrench_O,
                                          const ros::Duration& period);
 
+  /** Spring/damper holding the full attitude at orientation_d_. Base frame. */
+  Eigen::Matrix<double, 6, 1> orientationHoldWrench(
+      const Eigen::Isometry3d& pose, const Eigen::Matrix<double, 6, 1>& velocity) const;
+
   /** Clamped spring/damper for one held translational axis. */
   double lateralHoldForce(double offset, double velocity) const;
 
   /** One-sided virtual wall on a free axis. Returns 0 inside [min, max]. */
   double wallForce(double offset, double velocity, double min, double max) const;
-
-  Eigen::Matrix<double, 7, 1> nullspaceTorque(const Eigen::Matrix<double, 6, 7>& jacobian,
-                                              const Eigen::Matrix<double, 7, 1>& q,
-                                              const Eigen::Matrix<double, 7, 1>& dq) const;
 
   Eigen::Matrix<double, 7, 1> saturateTorqueRate(
       const Eigen::Matrix<double, 7, 1>& tau_d_calculated,
@@ -104,18 +130,21 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
       dynamic_server_weight_lift_param_;
 
  private:
-  // Stiff-hold targets. Captured from the startup pose in starting() so the
-  // INITIAL state stays put, then overwritten by beginAlignment() with the
-  // base-aligned targets (y = 0, diag(1, -1, -1)) for ALIGN and LIFT.
+  // Translational hold target. Captured from the startup pose in starting() so
+  // the INITIAL state stays put; beginAlignment() then sets its Y entry to 0.
+  // The X and Z entries only ever hold the arm still during INITIAL and ALIGN -
+  // in LIFT those two axes are free and the human sets them.
   Eigen::Vector3d hold_position_{Eigen::Vector3d::Zero()};
+  // Startup attitude, used only by the full 6-DOF hold of INITIAL and FAULT.
+  // From ALIGN on, the tool-axis constraint replaces it and the tool's tilt and
+  // spin are free, so there is no attitude target any more.
   Eigen::Quaterniond orientation_d_{Eigen::Quaterniond::Identity()};
-  // Nullspace reference for the elbow. Re-latched when the align move finishes,
-  // so it holds the configuration the aligned pose needs rather than the one the
-  // arm happened to start in.
-  Eigen::Matrix<double, 7, 1> q_d_nullspace_{Eigen::Matrix<double, 7, 1>::Zero()};
   // Wrench already acting when the controller started (an unmodelled tool
   // weight, mostly). Subtracted from the measurement and added to the command
-  // so the free plane is force-neutral apart from what we ask for.
+  // so the free DOF are force-neutral apart from what we ask for. The torque
+  // part matters as soon as ALIGN frees the tool's tilt and spin: without it an
+  // off-axis tool CoM would simply turn the tool over. It is only exact at the
+  // attitude where it was measured - a correct setLoad is the real fix.
   Eigen::Matrix<double, 6, 1> initial_wrench_O_{Eigen::Matrix<double, 6, 1>::Zero()};
 
   // Anchor of the virtual walls, latched the moment a non-zero force is asked
@@ -147,9 +176,6 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   double rotational_stiffness_{80.0};
   double rotational_damping_{14.0};
   double max_rotational_torque_{10.0};
-  // Keeps the redundant DOF near q_d_nullspace_. Projected into the nullspace of
-  // J^T, so it does not add end-effector force.
-  double nullspace_stiffness_{15.0};
 
   double wall_x_min_{-0.30};
   double wall_x_max_{0.30};
@@ -169,8 +195,8 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   double align_position_tolerance_{0.005};
   double align_orientation_tolerance_{0.02};
   double max_align_sec_{10.0};
-  double max_align_y_offset_{0.40};
-  double max_align_angle_{0.79};
+  double max_align_y_offset_{0.25};
+  double max_align_angle_{1.57};
 
   const double delta_tau_max_{1.0};
   const Eigen::Matrix<double, 7, 1> tau_max_ =
@@ -180,8 +206,9 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   /* State machine
    * 1. INITIAL: hold the startup pose stiffly in all six DOF until the external
    *    wrench estimate has settled, then latch it as the bias.
-   * 2. ALIGN: drive base Y to 0 and the attitude to diag(1, -1, -1), holding
-   *    base X and Z where they are. The arm moves on its own here.
+   * 2. ALIGN: drive base Y to 0 and the tool axis into the base X-Z plane,
+   *    holding base X and Z where they are and leaving the tool's tilt and spin
+   *    alone. The arm moves on its own here.
    * 3. LIFT: render the commanded downward force, free in the base X-Z plane.
    * FAULT: alignment was refused because the startup pose is too far off the
    *    targets; hold the startup pose and wait for the operator.
@@ -196,7 +223,7 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   void transitionToState(const ControllerState& new_state, const ros::Time& time);
   ControllerState handleInitialState(const Eigen::Matrix<double, 6, 1>& measured_wrench_O,
                                      const ros::Time& time);
-  /** Checks the startup pose and swaps in the base-aligned hold targets. */
+  /** Checks the startup pose and moves the base Y hold target onto 0. */
   ControllerState beginAlignment(const Eigen::Isometry3d& pose);
   ControllerState handleAlignState(const Eigen::Isometry3d& pose,
                                    const Eigen::Matrix<double, 6, 1>& velocity,

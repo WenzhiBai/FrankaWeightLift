@@ -1,12 +1,14 @@
 # Parameters of the weight-lift controller.
 #
-# Task frame is the robot base frame O (X forward, Y left, Z up). Base X and Z
-# are free (the human works in that vertical plane), base Y and all three
-# rotations are held. The commanded force is rendered along -Z, i.e. downwards.
+# Task frame is the robot base frame O (X forward, Y left, Z up). Only two of the
+# six end-effector DOF are held: base Y translation at 0, and the sideways tip of
+# the tool axis (end-effector Z) out of the base X-Z plane. Base X and Z
+# translation are free (the human works in that vertical plane), and so are the
+# tool's tilt within the plane and its spin while it hangs vertically. The
+# commanded force is rendered along -Z, i.e. downwards.
 #
-# Base Y is held at 0 and the attitude at diag(1, -1, -1), and the controller
-# drives the arm to both in its ALIGN state right after startup, so the end
-# effector always works in the base's own X-Z plane with the tool pointing down.
+# The controller drives the arm onto those two targets in its ALIGN state right
+# after startup, so the tool always hangs in the base's own X-Z plane.
 weight_lift_controller:
     type: franka_weight_lift/WeightLiftController
     arm_id: $(arg arm_id)
@@ -40,7 +42,8 @@ weight_lift_controller:
     integral_freeze_speed: 0.05   # m/s, integrate only below this z speed
 
     # --- held DOF ------------------------------------------------------------
-    # Base Y, held at 0 so the end effector works in the base's own X-Z plane.
+    # Base Y translation, held at 0 so the end effector works in the base's own
+    # X-Z plane.
     lateral_stiffness: 1200.0     # N/m
     lateral_damping: 55.0         # Ns/m  (0.8 * 2 * sqrt(k))
     # Clamp on the *stiffness* part of the lateral hold. It bounds how hard the
@@ -50,21 +53,22 @@ weight_lift_controller:
     # makes the align move faster and more abrupt. The damping term is outside
     # the clamp, so the arm still decelerates as it arrives.
     max_lateral_force: 30.0       # N
-    # All three rotations, held at diag(1, -1, -1): end-effector X along base X,
-    # end-effector Y along -base Y, end-effector Z along -base Z (tool down).
+    # The sideways tip of the tool axis out of the base X-Z plane - the one held
+    # rotational DOF. The torque acts only along the direction that changes that
+    # tip, so tilting the tool within the plane and spinning it while it hangs
+    # vertically both stay free and cost nothing.
     rotational_stiffness: 80.0    # Nm/rad
     rotational_damping: 14.0      # Nms/rad
     max_rotational_torque: 10.0   # Nm, clamp on the stiffness part, as above
-    # Also used as the 6-DOF hold while the INITIAL and ALIGN states run.
-    # Keeps the elbow near the configuration the aligned pose ended up in.
-    # Projected into the nullspace of J^T, so it adds no end-effector force.
-    nullspace_stiffness: 15.0
+    # The two above also serve as the full 6-DOF attitude hold while the INITIAL
+    # state settles, where max_rotational_torque clamps the whole torque vector.
 
-    # --- free plane ----------------------------------------------------------
-    # Base X and base Z carry no stiffness and no damping at all: the human sets
-    # the position there and should feel nothing but the commanded force. The
-    # walls and the speed cap below are the only terms that ever act in the
-    # plane, and both are zero until they are needed.
+    # --- free DOF ------------------------------------------------------------
+    # Base X and base Z translation carry no stiffness and no damping at all,
+    # and neither do the tool's tilt and spin: the human sets them and should
+    # feel nothing but the commanded force. The walls and the speed cap below
+    # are the only terms that ever act there, and both are zero until they are
+    # needed. There is no cap of any kind on the two free rotations.
 
     # --- virtual walls -------------------------------------------------------
     # Metres relative to the pose where a non-zero desired_force was first
@@ -73,10 +77,10 @@ weight_lift_controller:
     # and the rendered force has decayed, so the tool can be repositioned.
     # NOTE: the lower z wall has to hold the commanded pull, so it sags by
     # desired_force / wall_stiffness (10 N / 2000 N/m = 5 mm).
-    wall_x_min: -0.20
-    wall_x_max: 0.20
-    wall_z_min: -0.40
-    wall_z_max: 0.40
+    wall_x_min: -0.30
+    wall_x_max: 0.30
+    wall_z_min: -0.25
+    wall_z_max: 0.10
     wall_stiffness: 2000.0        # N/m
     wall_damping: 70.0            # Ns/m
 
@@ -86,8 +90,11 @@ weight_lift_controller:
 
     # --- startup -------------------------------------------------------------
     # Measure the wrench already acting on the flange (an unmodelled tool
-    # weight, mostly) and cancel it, so the free plane is force-neutral apart
-    # from the commanded force. Requires nobody touching the robot at startup.
+    # weight, mostly) and cancel it, so the free DOF are neutral apart from the
+    # commanded force. Requires nobody touching the robot at startup. The torque
+    # part of that bias is what keeps the tool's free tilt and spin from falling
+    # away, and it is only exact at the attitude where it was measured - a
+    # correct setLoad is the real fix for an unbalanced tool.
     compensate_initial_wrench: true
     settle_wrench_tolerance: 0.05 # N, per-tick change below which it is settled
     min_settle_sec: 1.0
@@ -96,12 +103,20 @@ weight_lift_controller:
     # --- alignment -----------------------------------------------------------
     # The ALIGN state runs once the wrench estimate has settled and commands
     # both targets straight away, so THE ARM MOVES ON ITS OWN at startup. It
-    # ends when the arm has stopped inside these tolerances, or on the timeout.
+    # removes the y offset and the tool-axis tip only, and leaves whatever tilt
+    # and spin the arm was parked with alone. It ends when the arm has stopped
+    # inside these tolerances, or on the timeout.
     align_position_tolerance: 0.005     # m of remaining y offset
-    align_orientation_tolerance: 0.02   # rad of remaining attitude error
+    align_orientation_tolerance: 0.02   # rad of remaining tool-axis tip
     max_align_sec: 10.0
     # Alignment is refused outright above these, since it is a snap to target
-    # rather than a planned motion: park the arm closer to the base X-Z plane,
-    # tool pointing down, and respawn the controller.
-    max_align_y_offset: 0.40      # m
-    max_align_angle: 0.79         # rad (45 deg)
+    # rather than a planned motion: park the arm closer to the base X-Z plane
+    # and respawn the controller.
+    max_align_y_offset: 0.25      # m
+    # rad of tool-axis tip. pi/2 is the largest tip that exists, so 1.57 admits
+    # any attitude at all and the guard effectively never fires. Note that at a
+    # tip of exactly pi/2 the tool axis lies along base Y, where no torque can
+    # bring it back into the plane: the restoring torque fades within a few
+    # degrees of that, so ALIGN would time out rather than converge. Use ~1.4
+    # (80 deg) if you want the guard to catch that instead.
+    max_align_angle: 1.57

@@ -4,7 +4,8 @@
 
   The end effector renders `desired_force` newtons downwards (along -Z of the
   robot base) while staying free to be moved by hand in the base X-Z plane.
-  Base Y is held at 0 and all three rotations at diag(1, -1, -1).
+  Base Y is held at 0 and the tool axis is held inside that plane; the tool
+  can be tilted and spun freely.
 
   THE ARM MOVES ON ITS OWN once spawned: the controller first measures and
   cancels the wrench already acting on the flange, then aligns the end effector

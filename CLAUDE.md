@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `franka_weight_lift` is a ROS 1 Noetic (Ubuntu 20.04) catkin package with a single `franka_hw`
 effort controller for a Franka Research 3 (FR3). It renders a constant downward force at the end
 effector while leaving the end effector free to be moved by hand inside the vertical X-Z plane of
-the robot base. Nothing but that force acts in the plane: base X and Z have no stiffness and no
-damping. See `README.md` for the control law, the design decisions and a tuning table.
+the robot base. Only two of the six DOF are held — base Y translation at 0, and the sideways tip of
+the tool axis out of the base X-Z plane. Everything else (base X and Z translation, the tool's tilt
+and spin) has no stiffness and no damping, and there is no nullspace term at all. See `README.md`
+for the control law, the design decisions and a tuning table.
 
 ## Build / run
 
@@ -54,19 +56,19 @@ Everything is in `src/weight_lift_controller.cpp` +
 (which also includes `franka_control.launch`).
 
 Control flow in `update()`: read `franka::RobotState` → build a 6x1 desired wrench in the **robot
-base frame** → `tau = J^T * wrench + nullspace + coriolis` → `saturateTorqueRate` → `setCommand`.
+base frame** → `tau = J^T * wrench + coriolis` → `saturateTorqueRate` → `setCommand`.
 
 The FSM is `INITIAL` → `ALIGN` → `LIFT`, plus a terminal `FAULT`:
 
 - `INITIAL` holds the startup pose stiffly in all six DOF (`poseHoldWrench`) until the external
   wrench estimate settles, then latches it as `initial_wrench_O_`.
-- `ALIGN` uses the same stiff hold, but `beginAlignment()` has swapped the hold targets for the
-  base-aligned ones (`hold_position_(y) = 0`, `orientation_d_ = diag(1,-1,-1)`), so the arm moves
-  itself onto them. It ends when the arm has stopped inside the align tolerances, or on
-  `max_align_sec`. `beginAlignment()` returns `FAULT` instead if the startup pose is further off
-  than `max_align_y_offset` / `max_align_angle`.
-- `LIFT` is the weight-lift law (`liftWrench`). `q_d_nullspace_` is re-latched on entry, since the
-  align move changed the joint configuration.
+- `ALIGN` (`alignWrench`) still holds the three translations stiffly, but `beginAlignment()` has
+  moved the base Y target onto 0, and the rotations are handed over to `toolAxisHoldWrench` — so the
+  tip is driven out and the tool's tilt and spin are left where they are. It ends when the arm has
+  stopped inside the align tolerances, or on `max_align_sec`. `beginAlignment()` returns `FAULT`
+  instead if the startup pose is further off than `max_align_y_offset` / `max_align_angle`.
+- `LIFT` is the weight-lift law (`liftWrench`), which uses the same `toolAxisHoldWrench` and frees
+  base X and Z.
 - `FAULT` holds the startup pose and logs; the operator has to reposition and respawn.
 
 ### Parameters
@@ -98,21 +100,41 @@ logging or a publisher to the 1 kHz path.
 
 ## Conventions
 
-- **Base frame is the task frame.** Free axes are base X (index 0) and base Z (index 2); base Y
-  (index 1) is held at 0 and all three rotations at `diag(1,-1,-1)`. `getZeroJacobian` is expressed
-  in the base frame, so every wrench assembled in `liftWrench` / `poseHoldWrench` must be too.
-- **The free plane carries nothing but the commanded force.** No stiffness, no damping. The only two
-  terms that ever act in base X/Z are the virtual walls and the `max_free_speed` brake, and both are
-  exactly zero until they trigger. Do not add a damping or centering term there — that is the whole
-  point of the controller.
+- **Base frame is the task frame.** Free translation axes are base X (index 0) and base Z
+  (index 2); base Y (index 1) is held at 0. `getZeroJacobian` is expressed in the base frame, so
+  every wrench assembled in `liftWrench` / `alignWrench` / `poseHoldWrench` must be too.
+- **The free DOF carry nothing but the commanded force.** No stiffness, no damping, no nullspace
+  term. The only two terms that ever act in base X/Z are the virtual walls and the `max_free_speed`
+  brake, and both are exactly zero until they trigger. Do not add a damping or centering term there,
+  and do not reintroduce a nullspace torque — it was tried, and it was felt on the tool.
+- **One rotational DOF is held, and it is geometric.** `toolAxisTip()` returns the signed angle by
+  which the tool axis (`pose.rotation().col(2)`, i.e. end-effector Z) has tipped out of the base X-Z
+  plane, plus the unit base-frame direction `normalize(tool_axis × y_base)` a torque must act along
+  to change it. `toolAxisHoldWrench()` acts *only* along that direction — spring and damping both —
+  which is what keeps tilt and spin exactly free: that direction never has a base-Y entry, and it
+  vanishes when the tip is zero. Do not replace this with the base-X entry of an attitude error
+  vector; the axis-angle error mixes components and reports a phantom tip (~8° at 30° tilt + 30°
+  yaw).
+- **The tip hold is singular at ±90°.** When the tool axis lies along base Y the cross product
+  vanishes, no torque can restore it, and `ToolAxisTip::axis` is exactly zero — every caller has to
+  check `axis.isZero()`. `max_align_angle` is what is meant to keep the arm away from there, and at
+  its configured 1.57 rad (= the largest tip that exists) it does not.
 - **Wrench signs follow libfranka.** `O_F_ext_hat_K` is the wrench the robot applies *to* the
   environment, in base coordinates, so a downward pull is a negative z entry both when commanding
   and when measuring. Do not "fix" the sign of the `initial_wrench_O_` term: it matches the
   convention documented in `franka/robot_state.h` and used by the sibling `~/repos/Seeing-Is-Enough`.
-- **The hold targets change once, in `beginAlignment()`.** `starting()` captures the measured
-  startup pose so `INITIAL` stays put; `beginAlignment()` then replaces the Y and orientation
-  targets with the base-aligned ones. Setting the aligned targets in `starting()` instead would make
-  the arm move while the wrench estimate is still settling and poison `initial_wrench_O_`.
+- **The hold target changes once, in `beginAlignment()`.** `starting()` captures the measured
+  startup pose so `INITIAL` stays put in all six DOF; `beginAlignment()` then sets
+  `hold_position_(y) = 0` — that is the only target that moves, because the tool-axis constraint has
+  no target to set. Doing it in `starting()` instead would make the arm move while the wrench
+  estimate is still settling and poison `initial_wrench_O_`.
+- **`orientation_d_` is only for `INITIAL` and `FAULT`.** Those two need a full 6-DOF stiff hold
+  (nothing may move while the bias is measured), which is what `orientationHoldWrench()` is still
+  there for. `ALIGN` and `LIFT` use `toolAxisHoldWrench()` instead and have no attitude target.
+- **The startup bias covers torque as well as force.** `liftWrench` adds all six components of
+  `initial_wrench_O_` and `alignWrench` adds the torque half. That is not cosmetic: with the tool's
+  tilt and spin free and undamped, an off-axis tool CoM turns the tool over without it. It is only
+  exact at the attitude where it was measured.
 - **Hold stiffness terms are clamped, damping terms are not.** `lateralHoldForce()` and
   `orientationHoldWrench()` clamp only the spring term (`max_lateral_force`,
   `max_rotational_torque`), leaving damping outside the clamp. That is what keeps the align snap from
@@ -137,6 +159,10 @@ applied), the free-plane speed cap (`max_free_speed` / `brake_damping`) and per-
 magnitude torque saturation (`delta_tau_max_`, `tau_max_`) are the only things bounding that — do not
 remove them, and keep `wall_*_min <= 0 <= wall_*_max` so the walls never arm around a pose that is
 already outside them.
+
+There is no equivalent bound on the two free rotations (no rate cap, no limit) and none on the
+redundant DOF now that the nullspace term is gone — the elbow is free to wander into its joint
+limits while the tool is dragged.
 
 While `desired_force` is 0 the walls are off by design and the plane is unbounded. That is deliberate
 (it is how the tool gets carried to the work), but it means the only bounds during that phase are the
