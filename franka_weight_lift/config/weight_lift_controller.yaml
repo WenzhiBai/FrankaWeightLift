@@ -77,10 +77,10 @@ weight_lift_controller:
     # and the rendered force has decayed, so the tool can be repositioned.
     # NOTE: the lower z wall has to hold the commanded pull, so it sags by
     # desired_force / wall_stiffness (10 N / 2000 N/m = 5 mm).
-    wall_x_min: -0.30
-    wall_x_max: 0.30
-    wall_z_min: -0.25
-    wall_z_max: 0.10
+    wall_x_min: -0.25
+    wall_x_max: 0.25
+    wall_z_min: -0.40
+    wall_z_max: 0.40
     wall_stiffness: 2000.0        # N/m
     wall_damping: 70.0            # Ns/m
 
@@ -88,15 +88,25 @@ weight_lift_controller:
     max_free_speed: 0.5           # m/s, braking starts above this
     brake_damping: 200.0          # Ns/m applied to the excess speed only
 
-    # --- startup -------------------------------------------------------------
+    # --- wrench bias ---------------------------------------------------------
     # Measure the wrench already acting on the flange (an unmodelled tool
     # weight, mostly) and cancel it, so the free DOF are neutral apart from the
-    # commanded force. Requires nobody touching the robot at startup. The torque
-    # part of that bias is what keeps the tool's free tilt and spin from falling
-    # away, and it is only exact at the attitude where it was measured - a
-    # correct setLoad is the real fix for an unbalanced tool.
+    # commanded force. Requires nobody touching the robot while it is measured:
+    # a hand resting on the tool is indistinguishable from a heavier tool and
+    # would be baked into every command afterwards.
+    #
+    # The bias is a constant, so it only holds at the configuration and attitude
+    # it was measured in. Joint friction and arm model error - the dominant
+    # error in the force you actually feel - are configuration dependent, so for
+    # an accurate force: get setLoad right first, then tick `recalibrate` in
+    # rqt_reconfigure at the pose you are about to work at, then raise k_p to
+    # close the loop on what is left.
     compensate_initial_wrench: true
-    settle_wrench_tolerance: 0.05 # N, per-tick change below which it is settled
+    # A sample this far from the running mean restarts the averaging window.
+    # Combined force/torque norm, so N and Nm are mixed in the one bound.
+    settle_wrench_tolerance: 0.2  # N
+    # Length of the stable window that gets averaged into the bias, and the
+    # give-up time after which the mean so far is used with a warning.
     min_settle_sec: 1.0
     max_settle_sec: 5.0
 
@@ -113,10 +123,7 @@ weight_lift_controller:
     # rather than a planned motion: park the arm closer to the base X-Z plane
     # and respawn the controller.
     max_align_y_offset: 0.25      # m
-    # rad of tool-axis tip. pi/2 is the largest tip that exists, so 1.57 admits
-    # any attitude at all and the guard effectively never fires. Note that at a
-    # tip of exactly pi/2 the tool axis lies along base Y, where no torque can
-    # bring it back into the plane: the restoring torque fades within a few
-    # degrees of that, so ALIGN would time out rather than converge. Use ~1.4
-    # (80 deg) if you want the guard to catch that instead.
-    max_align_angle: 1.57
+    # rad of tool-axis tip. pi/2 is the largest tip that exists, and at exactly
+    # pi/2 the tool axis lies along base Y where no torque can bring it back
+    # into the plane, so this stays well clear of it.
+    max_align_angle: 1.0          # rad (57 deg)

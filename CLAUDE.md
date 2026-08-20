@@ -69,6 +69,9 @@ The FSM is `INITIAL` → `ALIGN` → `LIFT`, plus a terminal `FAULT`:
   instead if the startup pose is further off than `max_align_y_offset` / `max_align_angle`.
 - `LIFT` is the weight-lift law (`liftWrench`), which uses the same `toolAxisHoldWrench` and frees
   base X and Z.
+- `CALIBRATE` re-measures the wrench bias at the current pose on operator request, holding that
+  pose stiffly in all six DOF while it does, then returns to `LIFT`. `beginCalibration()` refuses
+  the request unless the force is 0, the ramp has decayed and the arm is at rest.
 - `FAULT` holds the startup pose and logs; the operator has to reposition and respawn.
 
 ### Parameters
@@ -135,6 +138,17 @@ logging or a publisher to the 1 kHz path.
   `initial_wrench_O_` and `alignWrench` adds the torque half. That is not cosmetic: with the tool's
   tilt and spin free and undamped, an off-axis tool CoM turns the tool over without it. It is only
   exact at the attitude where it was measured.
+- **`updateWrenchBias()` is the only place the bias is written**, and both `INITIAL` and `CALIBRATE`
+  drive it — reset it by setting `bias_samples_ = 0`, never by assigning `initial_wrench_O_`
+  directly. It latches the *mean* over a window that restarts on any excursion beyond
+  `settle_wrench_tolerance`, so never replace it with a single-sample latch: one 1 kHz sample of
+  `O_F_ext_hat_K` is noise, and the force the operator feels is what the bias is for.
+- **The bias cannot separate the operator from the tool.** Nothing in `O_F_ext_hat_K` distinguishes
+  a steady hand from a heavier payload, so "nobody may touch the robot" is a procedural guarantee,
+  not something the code checks. It applies to `CALIBRATE` exactly as it does to `INITIAL`.
+- **`recalibrate` is edge triggered.** The reconfigure callback sets `recalibrate_requested_` only
+  on the false → true edge and `update()` clears it. Do not make it level triggered: a checkbox left
+  ticked would re-enter `CALIBRATE` forever.
 - **Hold stiffness terms are clamped, damping terms are not.** `lateralHoldForce()` and
   `orientationHoldWrench()` clamp only the spring term (`max_lateral_force`,
   `max_rotational_torque`), leaving damping outside the clamp. That is what keeps the align snap from

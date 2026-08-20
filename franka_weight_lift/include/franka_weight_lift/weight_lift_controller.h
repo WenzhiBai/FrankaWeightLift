@@ -108,6 +108,16 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   Eigen::Matrix<double, 6, 1> orientationHoldWrench(
       const Eigen::Isometry3d& pose, const Eigen::Matrix<double, 6, 1>& velocity) const;
 
+  /**
+   * Averages the external wrench estimate until it has held still for
+   * min_settle_sec_, then latches the mean as initial_wrench_O_. Any excursion
+   * from the running mean larger than settle_wrench_tolerance_ restarts the
+   * window, so the mean is always taken over a stretch where nothing moved.
+   * Returns true once the bias has been latched.
+   */
+  bool updateWrenchBias(const Eigen::Matrix<double, 6, 1>& measured_wrench_O,
+                        const ros::Time& time);
+
   /** Clamped spring/damper for one held translational axis. */
   double lateralHoldForce(double offset, double velocity) const;
 
@@ -146,6 +156,11 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   // off-axis tool CoM would simply turn the tool over. It is only exact at the
   // attitude where it was measured - a correct setLoad is the real fix.
   Eigen::Matrix<double, 6, 1> initial_wrench_O_{Eigen::Matrix<double, 6, 1>::Zero()};
+  // Accumulator updateWrenchBias() averages over. bias_samples_ == 0 means the
+  // window has not started yet, which is how INITIAL and CALIBRATE reset it.
+  Eigen::Matrix<double, 6, 1> bias_sum_{Eigen::Matrix<double, 6, 1>::Zero()};
+  int bias_samples_{0};
+  ros::Time bias_window_start_;
 
   // Anchor of the virtual walls, latched the moment a non-zero force is asked
   // for. While no force is asked for the walls are off and the free plane is
@@ -162,6 +177,10 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   double target_force_{0.0};
   double k_p_{0.0};
   double k_i_{0.0};
+  // Operator request to re-measure the wrench bias at the current pose, edge
+  // triggered on the reconfigure checkbox going false -> true.
+  bool recalibrate_requested_{false};
+  bool last_recalibrate_{false};
 
  private:
   // Parameters read from the config yaml.
@@ -188,7 +207,7 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   double brake_damping_{200.0};
 
   bool compensate_initial_wrench_{true};
-  double settle_wrench_tolerance_{0.05};
+  double settle_wrench_tolerance_{0.2};
   double min_settle_sec_{1.0};
   double max_settle_sec_{5.0};
 
@@ -196,7 +215,7 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   double align_orientation_tolerance_{0.02};
   double max_align_sec_{10.0};
   double max_align_y_offset_{0.25};
-  double max_align_angle_{1.57};
+  double max_align_angle_{1.0};
 
   const double delta_tau_max_{1.0};
   const Eigen::Matrix<double, 7, 1> tau_max_ =
@@ -210,10 +229,14 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
    *    holding base X and Z where they are and leaving the tool's tilt and spin
    *    alone. The arm moves on its own here.
    * 3. LIFT: render the commanded downward force, free in the base X-Z plane.
+   * CALIBRATE: re-measure the wrench bias at the pose the tool is in now, on
+   *    operator request, holding that pose stiffly while it does. Returns to
+   *    LIFT. This is the accurate way to zero the force: the bias latched at
+   *    spawn only holds at the configuration it was measured in.
    * FAULT: alignment was refused because the startup pose is too far off the
    *    targets; hold the startup pose and wait for the operator.
    */
-  enum class ControllerState { UNKNOWN, INITIAL, ALIGN, LIFT, FAULT };
+  enum class ControllerState { UNKNOWN, INITIAL, ALIGN, LIFT, CALIBRATE, FAULT };
 
   ControllerState current_state_{ControllerState::UNKNOWN};
   ControllerState previous_state_{ControllerState::UNKNOWN};
@@ -228,6 +251,9 @@ class WeightLiftController : public controller_interface::MultiInterfaceControll
   ControllerState handleAlignState(const Eigen::Isometry3d& pose,
                                    const Eigen::Matrix<double, 6, 1>& velocity,
                                    const ros::Time& time);
+  /** Checks the operator's recalibration request and holds the current pose. */
+  ControllerState beginCalibration(const Eigen::Isometry3d& pose,
+                                   const Eigen::Matrix<double, 6, 1>& velocity);
 };
 
 }  // namespace franka_weight_lift

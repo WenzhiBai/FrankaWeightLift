@@ -179,6 +179,11 @@ void WeightLiftController::starting(const ros::Time& time) {
   desired_force_ = 0.0;
   force_integral_ = 0.0;
 
+  // Nothing measured yet, and drop any recalibration request left from a
+  // previous spawn.
+  bias_samples_ = 0;
+  recalibrate_requested_ = false;
+
   // The walls only exist while a force is being rendered; they anchor themselves
   // the moment a non-zero force is requested.
   walls_armed_ = false;
@@ -236,6 +241,25 @@ void WeightLiftController::update(const ros::Time& time, const ros::Duration& pe
 
     case ControllerState::LIFT:
       wrench_d = liftWrench(pose, velocity, measured_wrench_O, period);
+      // After the wrench, so the hold targets beginCalibration() overwrites
+      // cannot affect the command this tick.
+      if (recalibrate_requested_) {
+        recalibrate_requested_ = false;
+        next_state = beginCalibration(pose, velocity);
+      }
+      break;
+
+    case ControllerState::CALIBRATE:
+      // Hold the pose stiffly in all six DOF, so nothing drifts into the
+      // measurement, and re-measure the bias where the work actually happens.
+      wrench_d = poseHoldWrench(pose, velocity);
+      if (updateWrenchBias(measured_wrench_O, time)) {
+        // Back onto the aligned base Y target, and drop the integral that was
+        // wound up against the old bias.
+        hold_position_(kLockedAxisY) = 0.0;
+        force_integral_ = 0.0;
+        next_state = ControllerState::LIFT;
+      }
       break;
 
     case ControllerState::FAULT:
@@ -442,6 +466,51 @@ Eigen::Matrix<double, 6, 1> WeightLiftController::orientationHoldWrench(
   return wrench;
 }
 
+bool WeightLiftController::updateWrenchBias(const Eigen::Matrix<double, 6, 1>& measured_wrench_O,
+                                            const ros::Time& time) {
+  if (bias_samples_ == 0) {
+    bias_sum_ = measured_wrench_O;
+    bias_samples_ = 1;
+    bias_window_start_ = time;
+    return false;
+  }
+
+  // Any excursion from the running mean restarts the window, so what gets
+  // latched is always a mean over a stretch where nothing was moving. A hand
+  // resting steadily on the tool is indistinguishable from a heavier tool,
+  // though - that is why nobody may touch the robot while this runs.
+  const Eigen::Matrix<double, 6, 1> mean = bias_sum_ / bias_samples_;
+  if ((measured_wrench_O - mean).norm() > settle_wrench_tolerance_) {
+    bias_sum_ = measured_wrench_O;
+    bias_samples_ = 1;
+    bias_window_start_ = time;
+    return false;
+  }
+  bias_sum_ += measured_wrench_O;
+  ++bias_samples_;
+
+  const double stable = (time - bias_window_start_).toSec();
+  if (stable >= min_settle_sec_) {
+    initial_wrench_O_ = bias_sum_ / bias_samples_;
+    ROS_INFO_STREAM("WeightLiftController: wrench bias latched over "
+                    << stable << "s (" << bias_samples_ << " samples): force "
+                    << initial_wrench_O_.head(3).transpose() << "N, torque "
+                    << initial_wrench_O_.tail(3).transpose() << "Nm");
+    return true;
+  }
+  if ((time - state_entry_time_).toSec() >= max_settle_sec_) {
+    initial_wrench_O_ = bias_sum_ / bias_samples_;
+    ROS_WARN_STREAM("WeightLiftController: the wrench estimate never held still for "
+                    << min_settle_sec_ << "s within " << max_settle_sec_ << "s; using the mean of "
+                    << "the last " << stable << "s (" << bias_samples_ << " samples): force "
+                    << initial_wrench_O_.head(3).transpose() << "N, torque "
+                    << initial_wrench_O_.tail(3).transpose()
+                    << "Nm. Raise settle_wrench_tolerance if the estimate is only noisy");
+    return true;
+  }
+  return false;
+}
+
 double WeightLiftController::lateralHoldForce(double offset, double velocity) const {
   // The stiffness term is clamped so a large offset - above all the y offset the
   // ALIGN state has to remove - cannot slam the arm across it. The damping term
@@ -485,6 +554,12 @@ void WeightLiftController::weightLiftParamCallback(
   k_i_ = config.k_i;
   ROS_INFO_STREAM("WeightLiftController: desired_force " << target_force_ << "N, k_p " << k_p_
                                                          << ", k_i " << k_i_);
+  // Momentary trigger: only the false -> true edge counts, so the checkbox has
+  // to be unticked again before it can fire a second time.
+  if (config.recalibrate && !last_recalibrate_) {
+    recalibrate_requested_ = true;
+  }
+  last_recalibrate_ = config.recalibrate;
   // The lower z wall has to hold the commanded pull, so its steady-state
   // penetration is desired_force / wall_stiffness. Warn if that is coarse.
   const double wall_penetration = target_force_ / std::max(wall_stiffness_, 1.0);
@@ -505,6 +580,8 @@ std::string WeightLiftController::stateToString(ControllerState state) const {
       return "ALIGN";
     case ControllerState::LIFT:
       return "LIFT";
+    case ControllerState::CALIBRATE:
+      return "CALIBRATE";
     case ControllerState::FAULT:
       return "FAULT";
     default:
@@ -530,26 +607,9 @@ WeightLiftController::ControllerState WeightLiftController::handleInitialState(
     return ControllerState::ALIGN;
   }
 
-  // Track the estimate until it stops moving, then keep the last value as bias.
-  const double change = (measured_wrench_O - initial_wrench_O_).norm();
-  initial_wrench_O_ = measured_wrench_O;
-
-  const double elapsed = (time - state_entry_time_).toSec();
-  if (elapsed >= min_settle_sec_ && change < settle_wrench_tolerance_) {
-    ROS_INFO_STREAM("WeightLiftController: external wrench settled at force "
-                    << initial_wrench_O_.head(3).transpose() << "N, torque "
-                    << initial_wrench_O_.tail(3).transpose() << "Nm");
+  if (updateWrenchBias(measured_wrench_O, time)) {
     return ControllerState::ALIGN;
   }
-  if (elapsed >= max_settle_sec_) {
-    ROS_WARN_STREAM("WeightLiftController: external wrench estimate did not settle within "
-                    << max_settle_sec_ << "s (last change " << change
-                    << "N), aligning anyway with initial force "
-                    << initial_wrench_O_.head(3).transpose() << "N, torque "
-                    << initial_wrench_O_.tail(3).transpose() << "Nm");
-    return ControllerState::ALIGN;
-  }
-
   return ControllerState::INITIAL;
 }
 
@@ -575,6 +635,39 @@ WeightLiftController::ControllerState WeightLiftController::beginAlignment(
                   << y_offset << "m of y offset and " << tip_angle
                   << "rad of tool-axis tip; the tool's tilt and spin are left as they are");
   return ControllerState::ALIGN;
+}
+
+WeightLiftController::ControllerState WeightLiftController::beginCalibration(
+    const Eigen::Isometry3d& pose, const Eigen::Matrix<double, 6, 1>& velocity) {
+  if (!compensate_initial_wrench_) {
+    ROS_WARN_STREAM(
+        "WeightLiftController: initial wrench compensation is disabled, ignoring the "
+        "recalibration request");
+    return ControllerState::LIFT;
+  }
+  // A bias measured while we are still pulling would bake in the reaction to
+  // our own pull, or the hand holding the tool against it.
+  if (target_force_ > 0.0 || desired_force_ > kForceOffThreshold) {
+    ROS_WARN_STREAM(
+        "WeightLiftController: recalibration needs desired_force at 0 and the ramp "
+        "decayed (still rendering "
+        << desired_force_ << "N), ignoring the request");
+    return ControllerState::LIFT;
+  }
+  if (velocity.head(3).norm() > kAlignSettleSpeed || velocity.tail(3).norm() > kAlignSettleRate) {
+    ROS_WARN_STREAM(
+        "WeightLiftController: recalibration needs the arm at rest, ignoring the request");
+    return ControllerState::LIFT;
+  }
+
+  // Hold the pose we are in right now, in all six DOF, including the free ones.
+  hold_position_ = pose.translation();
+  orientation_d_ = Eigen::Quaterniond(pose.rotation());
+  bias_samples_ = 0;
+  ROS_WARN_STREAM(
+      "WeightLiftController: recalibrating the wrench bias at this pose - do NOT touch the robot "
+      "until the new bias is logged");
+  return ControllerState::CALIBRATE;
 }
 
 WeightLiftController::ControllerState WeightLiftController::handleAlignState(

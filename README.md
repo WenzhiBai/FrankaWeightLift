@@ -82,11 +82,20 @@ the torque acts only along the one direction that changes the tip.
 - **The startup wrench is measured and cancelled, torque included.** An unmodelled tool weight
   would otherwise add to the commanded pull, since the free plane has no vertical stiffness to hold
   it — and its *torque* would turn the tool over, since the tilt and spin have no stiffness either.
-  The controller spends its `INITIAL` state holding the startup pose stiffly in all six DOF until
-  the estimate settles, then latches the whole wrench. **Do not touch the robot until `weight lift
-  active` is logged.** That bias is only exact at the attitude where it was measured, so a correct
-  `setLoad` is the real fix for a badly balanced tool; set `compensate_initial_wrench: false` if you
-  would rather not have the bias term at all.
+  The controller spends its `INITIAL` state holding the startup pose stiffly in all six DOF, and
+  latches the *mean* of the estimate over a window in which it held still (`min_settle_sec` of
+  samples within `settle_wrench_tolerance` of the running mean; any excursion restarts the window).
+  **Do not touch the robot until `weight lift active` is logged** — a hand resting steadily on the
+  tool is indistinguishable from a heavier tool, and nothing in the estimate can separate them.
+  Set `compensate_initial_wrench: false` if you would rather not have the bias term at all.
+- **The bias is a constant, so it only holds where it was measured.** Tool weight is a constant
+  vector in base coordinates and is compensated well. Joint friction and arm model error are *not*:
+  they are configuration-dependent, and they are the dominant error in the force the human actually
+  feels. The tool's torque is attitude-dependent too, now that tilt and spin are free. In order of
+  effect, the ways to get an accurate force are: get `setLoad` right (it fixes the estimator's
+  baseline at every configuration, not just one); tick `recalibrate` in `rqt_reconfigure` at the
+  pose you are about to work at; then raise `k_p` so the loop keeps correcting what is left. Without
+  a wrist force/torque sensor, the joint-torque estimate is the accuracy ceiling.
 - **`desired_force` starts at 0, and the walls follow it.** With no force asked for, the tool can be
   carried anywhere in the plane — the walls are off entirely. The moment a non-zero force is
   requested the walls arm themselves and anchor on the pose the tool is in right then, so the
@@ -134,8 +143,13 @@ roslaunch franka_weight_lift weight_lift.launch desired_force:=25.0
 
 `desired_force` defaults to **0 N**, and `run_experiment.sh` always opens `rqt_reconfigure`
 (`rqt_reconfigure` → `weight_lift_controller`), which is how the controller is meant to be driven:
-let it align, move the tool to where the work is, then dial the force up. `k_p` and `k_i` are live
-there too. Everything else lives in `franka_weight_lift/config/weight_lift_controller.yaml`, which
+let it align, move the tool to where the work is, tick **`recalibrate`** and let go of the tool
+while it re-zeroes, then dial the force up. `k_p` and `k_i` are live there too.
+
+`recalibrate` is a momentary trigger — it acts on the false → true edge, so untick it to arm it
+again. It is only accepted with `desired_force` at 0, the ramp decayed and the arm at rest; while it
+runs the controller holds the current pose stiffly in all six DOF and **nobody may touch the
+robot**, exactly as at startup. Everything else lives in `franka_weight_lift/config/weight_lift_controller.yaml`, which
 is the single source of truth — `init()` seeds the reconfigure server from it, so the yaml wins at
 startup.
 
@@ -170,7 +184,9 @@ scripts/
 | --- | --- |
 | tool drifts sideways out of the plane | raise `lateral_stiffness`, or `max_lateral_force` if it is saturating |
 | tool tips sideways out of the plane | raise `rotational_stiffness` / `max_rotational_torque` |
-| tool tips or spins under its own weight | `setLoad` is wrong; the startup torque bias only cancels it at the attitude where it was measured |
+| tool tips or spins under its own weight | `setLoad` is wrong; the torque bias only cancels it at the attitude where it was measured. Tick `recalibrate` at the working attitude |
+| felt force is off by a newton or two | tick `recalibrate` at the working pose, then raise `k_p`. A constant bias cannot track configuration-dependent friction |
+| `the wrench estimate never held still` | the estimate is noisier than `settle_wrench_tolerance`; raise it, or accept the averaged fallback |
 | yawing the tool feels sticky | expected once the tool is tilted — that motion takes the tool axis out of the plane. Lower `rotational_stiffness` / `rotational_damping` to soften it |
 | free plane drifts or feels lively when released | it is undamped by design; the speed cap is the only brake. Lower `max_free_speed` |
 | align move at startup is too brisk | lower `max_lateral_force` / `max_rotational_torque` |
